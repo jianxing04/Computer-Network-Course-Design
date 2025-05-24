@@ -61,6 +61,7 @@ void parse_dns_query(unsigned char* buffer, int len, char* domain, int domain_si
 void send_dns_response(SOCKET sockfd, struct sockaddr_in* client_addr, int client_addr_len,
     unsigned char* request, int request_len, const char* ip);
 DWORD WINAPI handle_client(LPVOID arg);
+void search_in_file(const char* domain, char* ip);
 
 int main() {
     WSADATA wsaData;
@@ -220,6 +221,7 @@ DWORD WINAPI handle_client(LPVOID arg) {
         free(param);
         return 1;
     }
+	ip[0] = '\0'; // 初始化 IP 字符串为空
 
     // 检查是否为反向 DNS 查询
     if (strstr(domain, ".in-addr.arpa") != NULL) {
@@ -227,8 +229,11 @@ DWORD WINAPI handle_client(LPVOID arg) {
         strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1");
     }
     else {
-        // 正向 DNS 查询，在域名库中查找 IP
-        strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
+        // 正向 DNS 查询，在 dnsrelay.txt 文件中查找 IP
+		search_in_file(domain, ip);
+        if (strlen(ip) == 0) {
+            strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
+        }
     }
 
     // 发送响应
@@ -371,4 +376,30 @@ void send_dns_response(SOCKET sockfd, struct sockaddr_in* client_addr, int clien
 
     // 释放响应缓冲区
     free(response);
+}
+
+// 在文件中查找域名对应的IP地址
+void search_in_file(const char* domain, char* ip) {
+    FILE* file;
+    if (fopen_s(&file, DNSRELAY_FILE, "r") == 0) {
+		char line[MAX_DOMAIN_LENGTH + MAX_IP_LENGTH + 5];// 预留空间给域名、IP和空格
+        while (fgets(line, sizeof(line), file) != NULL) {
+            char file_ip[MAX_IP_LENGTH];
+            char file_domain[MAX_DOMAIN_LENGTH];
+            if (sscanf_s(line, "%15s %255s", file_ip, (unsigned int)sizeof(file_ip),
+                file_domain, (unsigned int)sizeof(file_domain)) == 2) {
+                file_ip[MAX_IP_LENGTH - 1] = '\0'; // 确保 file_ip 以零终止符结尾
+                file_domain[MAX_DOMAIN_LENGTH - 1] = '\0'; // 确保 file_domain 以零终止符结尾
+                if (strcmp(file_domain, domain) == 0) {
+                    strcpy_s(ip, MAX_IP_LENGTH, file_ip);
+					printf("在文件中找到域名 %s 对应的 IP: %s\n", domain, ip);
+                    break;
+                }
+            }
+        }
+        fclose(file);
+    }
+    else {
+		printf("无法打开文件 %s\n", DNSRELAY_FILE);
+    }
 }
