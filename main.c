@@ -36,34 +36,47 @@ typedef struct {
 } DNS_HEADER;
 
 // 缓存条目结构
-typedef struct {
-    char domain[256];
-    char ip[16];
-    time_t timestamp;
+typedef struct CacheEntry {
+	char domain[MAX_DOMAIN_LENGTH];// 域名
+	char ip[MAX_IP_LENGTH];// IP地址
+	time_t timestamp;// 缓存时间戳
+	struct CacheEntry* prev;// 指向前一个条目
+	struct CacheEntry* next;// 指向下一个条目
 } CACHE_ENTRY;
+
+// LRU缓存结构
+typedef struct {
+	CACHE_ENTRY* head;// 指向最新的条目
+	CACHE_ENTRY* tail;// 指向最旧的条目
+	int count;// 当前缓存条目数量
+	CRITICAL_SECTION lock;// 互斥锁保护缓存
+} LRU_CACHE;
 
 // 传递给线程的参数结构
 typedef struct {
-    SOCKET sockfd;
-    struct sockaddr_in client_addr;
-    int client_addr_len;
-    unsigned char* buffer;
-    int recv_len;
+	SOCKET sockfd;// 套接字描述符
+	struct sockaddr_in client_addr;// 客户端地址
+	int client_addr_len;// 客户端地址长度
+	unsigned char* buffer;// 接收缓冲区
+	int recv_len;// 接收数据长度
 } CLIENT_PARAM;
 
 // 全局变量
-CACHE_ENTRY cache[MAX_CACHE_ENTRIES];
-CRITICAL_SECTION cache_lock;
-int cache_count = 0;
+LRU_CACHE cache;// LRU缓存
 LONG count_recv = 0;  // 使用 LONG 类型配合原子操作
 
 // 函数声明
-void parse_dns_query(unsigned char* buffer, int len, char* domain, int domain_size);
+void parse_dns_query(unsigned char* buffer, int len, char* domain, int domain_size);// 解析DNS查询中的域名
 void send_dns_response(SOCKET sockfd, struct sockaddr_in* client_addr, int client_addr_len,
     unsigned char* request, int request_len, const char* ip);
-DWORD WINAPI handle_client(LPVOID arg);
-void search_in_file(const char* domain, char* ip);
-void query_external_dns(unsigned char* request, int request_len, char* ip);
+DWORD WINAPI handle_client(LPVOID arg);// 处理客户端请求的线程函数
+void search_in_file(const char* domain, char* ip);// 在文件中查找域名对应的IP地址
+void query_external_dns(unsigned char* request, int request_len, char* ip);// 查询外部 DNS 服务器
+void init_cache();// 初始化缓存
+void add_to_cache(const char* domain, const char* ip);// 添加到缓存
+void find_in_cache(const char* domain, char* ip);// 在缓存中查找
+void remove_from_cache(CACHE_ENTRY* entry);// 从缓存中移除条目
+void move_to_front(CACHE_ENTRY* entry);// 将条目移动到链表头部
 
 int main() {
     WSADATA wsaData;
@@ -111,7 +124,7 @@ int main() {
 
     printf("DNS中继服务器启动，监听地址: 127.0.0.1:%d\n", DNS_PORT);
 
-    InitializeCriticalSection(&cache_lock);  // 初始化缓存锁
+    init_cache();  // 初始化缓存
 
     // 主循环
     while (1) {
@@ -180,7 +193,15 @@ int main() {
     }
 
     // 清理资源（实际上不会执行到这里）
-    DeleteCriticalSection(&cache_lock);
+    EnterCriticalSection(&cache.lock);
+    CACHE_ENTRY* current = cache.head;
+    while (current != NULL) {
+        CACHE_ENTRY* next = current->next;
+        free(current);
+        current = next;
+    }
+    LeaveCriticalSection(&cache.lock);
+    DeleteCriticalSection(&cache.lock);
     closesocket(sockfd);
     WSACleanup();
     return 0;
@@ -231,15 +252,30 @@ DWORD WINAPI handle_client(LPVOID arg) {
         strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1");
     }
     else {
-        // 正向 DNS 查询，在 dnsrelay.txt 文件中查找 IP
-        search_in_file(domain, ip);
+        // 先从缓存中查找
+        find_in_cache(domain, ip);
         if (strlen(ip) == 0) {
-            // 在文件中未找到，查询外部 DNS 服务器
-            query_external_dns(buffer, recv_len, ip);
+            // 缓存中未找到，在 dnsrelay.txt 文件中查找 IP
+            search_in_file(domain, ip);
             if (strlen(ip) == 0) {
-                strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
+                // 在文件中未找到，查询外部 DNS 服务器
+                query_external_dns(buffer, recv_len, ip);
+                if (strlen(ip) == 0) {
+                    strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
+                }
+                else {
+					printf("查询外部 DNS 服务器成功，域名 %s 对应的 IP: %s\n", domain, ip);
+                }
             }
+            else {
+				printf("在文件中找到域名 %s 对应的 IP: %s\n", domain, ip);
+            }
+            // 将查询结果添加到缓存
+            add_to_cache(domain, ip);
         }
+        else {
+            printf("从缓存中找到域名 %s 对应的 IP: %s\n", domain, ip);
+		}
     }
 
     // 发送响应
@@ -413,7 +449,7 @@ void search_in_file(const char* domain, char* ip) {
 // 查询外部 DNS 服务器
 void query_external_dns(unsigned char* request, int request_len, char* ip) {
     // 创建专用套接字用于外部 DNS 查询
-	SOCKET dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);// 创建 UDP 套接字
+    SOCKET dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);// 创建 UDP 套接字
     if (dns_sock == INVALID_SOCKET) {
         printf("创建外部 DNS 查询套接字失败: %d\n", WSAGetLastError());
         return;
@@ -421,9 +457,9 @@ void query_external_dns(unsigned char* request, int request_len, char* ip) {
 
     struct sockaddr_in external_dns_addr;
     memset(&external_dns_addr, 0, sizeof(external_dns_addr));
-	external_dns_addr.sin_family = AF_INET;// IPv4
-	external_dns_addr.sin_port = htons(DNS_PORT);// DNS 端口
-	inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &external_dns_addr.sin_addr);// 外部 DNS 服务器地址
+    external_dns_addr.sin_family = AF_INET;// IPv4
+    external_dns_addr.sin_port = htons(DNS_PORT);// DNS 端口
+    inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &external_dns_addr.sin_addr);// 外部 DNS 服务器地址
 
     // 设置接收超时（1秒）
     int timeout = 1000; // 1秒
@@ -507,7 +543,7 @@ void query_external_dns(unsigned char* request, int request_len, char* ip) {
             memcpy(ip_parts, &response[response_pos], 4);
             sprintf_s(ip, MAX_IP_LENGTH, "%hhu.%hhu.%hhu.%hhu", ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
 
-			//关闭套接字并返回
+            // 关闭套接字并返回
             closesocket(dns_sock);
             return;
         }
@@ -519,4 +555,113 @@ void query_external_dns(unsigned char* request, int request_len, char* ip) {
 
     printf("外部 DNS 查询失败，尝试所有重试后仍无响应\n");
     closesocket(dns_sock);
+}
+
+// 初始化缓存
+void init_cache() {
+    InitializeCriticalSection(&cache.lock);
+    cache.head = NULL;
+    cache.tail = NULL;
+    cache.count = 0;
+}
+
+// 添加到缓存
+void add_to_cache(const char* domain, const char* ip) {
+    EnterCriticalSection(&cache.lock);
+
+    // 检查缓存是否已满
+    if (cache.count >= MAX_CACHE_ENTRIES) {
+        // 移除最旧的条目
+		CACHE_ENTRY* oldest = cache.tail;// 获取尾部条目（最旧的条目）
+        if (oldest != NULL) {
+            remove_from_cache(oldest);
+            free(oldest);
+        }
+    }
+
+    // 创建新的缓存条目
+    CACHE_ENTRY* new_entry = (CACHE_ENTRY*)malloc(sizeof(CACHE_ENTRY));
+    if (new_entry != NULL) {
+        strcpy_s(new_entry->domain, MAX_DOMAIN_LENGTH, domain);
+        strcpy_s(new_entry->ip, MAX_IP_LENGTH, ip);
+        new_entry->timestamp = time(NULL);
+        new_entry->prev = NULL;
+        new_entry->next = NULL;
+
+        // 将新条目添加到链表头部
+		if (cache.head == NULL) {// 如果缓存为空
+            cache.head = new_entry;
+            cache.tail = new_entry;
+        }
+        else {
+            new_entry->next = cache.head;
+            cache.head->prev = new_entry;
+            cache.head = new_entry;
+        }
+
+        cache.count++;
+    }
+
+    LeaveCriticalSection(&cache.lock);
+}
+
+// 在缓存中查找
+void find_in_cache(const char* domain, char* ip) {
+    EnterCriticalSection(&cache.lock);
+
+    CACHE_ENTRY* current = cache.head;
+    while (current != NULL) {
+        if (strcmp(current->domain, domain) == 0) {
+            // 检查缓存是否过期
+            if (time(NULL) - current->timestamp <= CACHE_TTL) {
+                strcpy_s(ip, MAX_IP_LENGTH, current->ip);
+                // 将该条目移动到链表头部
+                move_to_front(current);
+                LeaveCriticalSection(&cache.lock);
+                return ;
+            }
+            else {
+                // 缓存过期，移除该条目
+                remove_from_cache(current);
+                free(current);
+                cache.count--;
+                break;
+            }
+        }
+        current = current->next;
+    }
+
+    LeaveCriticalSection(&cache.lock);
+}
+
+// 从缓存中移除条目
+void remove_from_cache(CACHE_ENTRY* entry) {
+    if (entry->prev != NULL) {
+        entry->prev->next = entry->next;
+    }
+    else {
+        cache.head = entry->next;
+    }
+
+    if (entry->next != NULL) {
+        entry->next->prev = entry->prev;
+    }
+    else {
+        cache.tail = entry->prev;
+    }
+}
+
+// 将条目移动到链表头部
+void move_to_front(CACHE_ENTRY* entry) {
+    if (entry == cache.head) {
+        return;
+    }
+
+    remove_from_cache(entry);
+
+	entry->timestamp = time(NULL); // 更新时间戳
+    entry->next = cache.head;
+    entry->prev = NULL;
+    cache.head->prev = entry;
+    cache.head = entry;
 }
