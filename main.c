@@ -63,8 +63,7 @@ void send_dns_response(SOCKET sockfd, struct sockaddr_in* client_addr, int clien
     unsigned char* request, int request_len, const char* ip);
 DWORD WINAPI handle_client(LPVOID arg);
 void search_in_file(const char* domain, char* ip);
-void query_external_dns(SOCKET client_sock, struct sockaddr_in* client_addr, int client_addr_len,
-    unsigned char* request, int request_len, char* ip);
+void query_external_dns(unsigned char* request, int request_len, char* ip);
 
 int main() {
     WSADATA wsaData;
@@ -236,7 +235,7 @@ DWORD WINAPI handle_client(LPVOID arg) {
         search_in_file(domain, ip);
         if (strlen(ip) == 0) {
             // 在文件中未找到，查询外部 DNS 服务器
-            query_external_dns(sockfd, &client_addr, client_addr_len, buffer, recv_len, ip);
+            query_external_dns(buffer, recv_len, ip);
             if (strlen(ip) == 0) {
                 strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
             }
@@ -412,10 +411,9 @@ void search_in_file(const char* domain, char* ip) {
 }
 
 // 查询外部 DNS 服务器
-void query_external_dns(SOCKET client_sock, struct sockaddr_in* client_addr, int client_addr_len,
-    unsigned char* request, int request_len, char* ip) {
+void query_external_dns(unsigned char* request, int request_len, char* ip) {
     // 创建专用套接字用于外部 DNS 查询
-    SOCKET dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	SOCKET dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);// 创建 UDP 套接字
     if (dns_sock == INVALID_SOCKET) {
         printf("创建外部 DNS 查询套接字失败: %d\n", WSAGetLastError());
         return;
@@ -423,9 +421,9 @@ void query_external_dns(SOCKET client_sock, struct sockaddr_in* client_addr, int
 
     struct sockaddr_in external_dns_addr;
     memset(&external_dns_addr, 0, sizeof(external_dns_addr));
-    external_dns_addr.sin_family = AF_INET;
-    external_dns_addr.sin_port = htons(DNS_PORT);
-    inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &external_dns_addr.sin_addr);
+	external_dns_addr.sin_family = AF_INET;// IPv4
+	external_dns_addr.sin_port = htons(DNS_PORT);// DNS 端口
+	inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &external_dns_addr.sin_addr);// 外部 DNS 服务器地址
 
     // 设置接收超时（1秒）
     int timeout = 1000; // 1秒
@@ -508,13 +506,8 @@ void query_external_dns(SOCKET client_sock, struct sockaddr_in* client_addr, int
             unsigned char ip_parts[4];
             memcpy(ip_parts, &response[response_pos], 4);
             sprintf_s(ip, MAX_IP_LENGTH, "%hhu.%hhu.%hhu.%hhu", ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
-            printf("从外部 DNS 服务器获取到域名对应的 IP: %s\n", ip);
 
-            // 直接使用外部 DNS 的完整响应，而不是重新构建
-            sendto(client_sock, (char*)response, recv_len, 0,
-                (struct sockaddr*)client_addr, client_addr_len);
-            printf("已将外部 DNS 响应转发给客户端\n");
-
+			//关闭套接字并返回
             closesocket(dns_sock);
             return;
         }
