@@ -260,8 +260,8 @@ DWORD WINAPI handle_client(LPVOID arg) {
             if (strlen(ip) == 0) {
                 // 在文件中未找到，查询外部 DNS 服务器
                 query_external_dns(buffer, recv_len, ip);
-                if (strlen(ip) == 0) {
-                    strcpy_s(ip, MAX_IP_LENGTH, "127.0.0.1"); // 默认 IP
+                if (strlen(ip) == 0) {//都找不到
+                    strcpy_s(ip, MAX_IP_LENGTH, "0.0.0.0"); //找不到
                 }
                 else {
 					printf("查询外部 DNS 服务器成功，域名 %s 对应的 IP: %s\n", domain, ip);
@@ -362,49 +362,59 @@ void send_dns_response(SOCKET sockfd, struct sockaddr_in* client_addr, int clien
     DNS_HEADER* header = (DNS_HEADER*)response;
     header->qr = 1;    // 查询/响应标志设为响应
     header->ra = 1;    // 递归可用
-    header->ancount = htons(1);  // 一个回答记录
 
-    // 复制问题部分到响应
-    int question_len = 0;
-    unsigned char* qname = request + sizeof(DNS_HEADER);
-    while (question_len < request_len - sizeof(DNS_HEADER) && qname[question_len] != 0) {
-        question_len++;
+	int response_pos = sizeof(DNS_HEADER);// 响应位置从头部开始
+    if (strcmp(ip, "0.0.0.0") == 0) {
+        header->rcode = 3;  // 3表示域名不存在(NXDOMAIN)
+        header->ancount = htons(0);  // 没有回答记录
+        printf("拦截域名查询，返回域名不存在错误\n");
     }
-    question_len++;  // 加上结尾的'0'字符
-    question_len += 4;  // 加上 QTYPE 和 QCLASS (4字节)
-    memcpy(response + sizeof(DNS_HEADER), qname, question_len);
+    else {
+        header->rcode = 0;  // 0表示没有错误
+        header->ancount = htons(1);  // 一个回答记录
 
-    // 构建回答部分
-    int response_pos = sizeof(DNS_HEADER) + question_len;
+	    int question_len = 0; // 问题部分长度
+        // 复制问题部分到响应
+        unsigned char* qname = request + sizeof(DNS_HEADER);
+        while (question_len < request_len - sizeof(DNS_HEADER) && qname[question_len] != 0) {
+            question_len++;
+        }
+        question_len++;  // 加上结尾的'0'字符
+        question_len += 4;  // 加上 QTYPE 和 QCLASS (4字节)
+        memcpy(response + sizeof(DNS_HEADER), qname, question_len);
 
-    // 域名指针 (指向问题部分的域名),NAME部分使用压缩指针
-    response[response_pos++] = 0xC0;  // 压缩指针
-    response[response_pos++] = 0x0C;  // 指向问题部分的域名,偏移量为12字节
+        // 构建回答部分
+        response_pos = sizeof(DNS_HEADER) + question_len;
 
-    // 类型和类 (A记录, IN类)
-    response[response_pos++] = 0x00;
-    response[response_pos++] = 0x01;  // TYPE A，IPv4地址，2字节
-    response[response_pos++] = 0x00;
-    response[response_pos++] = 0x01;  // CLASS IN，互联网，2字节
+        // 域名指针 (指向问题部分的域名),NAME部分使用压缩指针
+        response[response_pos++] = 0xC0;  // 压缩指针
+        response[response_pos++] = 0x0C;  // 指向问题部分的域名,偏移量为12字节
 
-    // TTL (300秒)
-    unsigned int ttl = htonl(300);// 300秒，4字节，网络字节序
-    memcpy(&response[response_pos], &ttl, 4);
-    response_pos += 4;
+        // 类型和类 (A记录, IN类)
+        response[response_pos++] = 0x00;
+        response[response_pos++] = 0x01;  // TYPE A，IPv4地址，2字节
+        response[response_pos++] = 0x00;
+        response[response_pos++] = 0x01;  // CLASS IN，互联网，2字节
 
-    // RDLENGTH (IPv4地址长度)
-    response[response_pos++] = 0x00;
-    response[response_pos++] = 0x04;// IPv4地址长度，4字节
+        // TTL (300秒)
+        unsigned int ttl = htonl(300); // 300秒，4字节，网络字节序
+        memcpy(&response[response_pos], &ttl, 4);
+        response_pos += 4;
 
-    // IP地址
-    unsigned char ip_parts[4];
-    if (sscanf_s(ip, "%hhu.%hhu.%hhu.%hhu", &ip_parts[0], &ip_parts[1], &ip_parts[2], &ip_parts[3]) != 4) {// 检查IP地址格式
-        printf("Invalid IP address format: %s\n", ip);
-        free(response);
-        return;
+        // RDLENGTH (IPv4地址长度)
+        response[response_pos++] = 0x00;
+        response[response_pos++] = 0x04; // IPv4地址长度，4字节
+
+        // IP地址
+        unsigned char ip_parts[4];
+        if (sscanf_s(ip, "%hhu.%hhu.%hhu.%hhu", &ip_parts[0], &ip_parts[1], &ip_parts[2], &ip_parts[3]) != 4) {
+            printf("Invalid IP address format: %s\n", ip);
+            free(response);
+            return;
+        }
+        memcpy(&response[response_pos], ip_parts, 4);
+        response_pos += 4;
     }
-    memcpy(&response[response_pos], ip_parts, 4);// 4字节的IPv4地址
-    response_pos += 4;
 
     // 发送响应
     int sent_bytes = sendto(sockfd, (char*)response, response_pos, 0,
