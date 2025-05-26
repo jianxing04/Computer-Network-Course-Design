@@ -110,9 +110,9 @@ int main() {
 
     // 准备服务器地址
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(DNS_PORT);
+	server_addr.sin_family = AF_INET;// IPv4
+	server_addr.sin_addr.s_addr = INADDR_ANY;// 监听所有接口
+	server_addr.sin_port = htons(DNS_PORT);// DNS端口
 
     // 绑定套接字
     if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
