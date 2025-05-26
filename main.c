@@ -77,6 +77,8 @@ void add_to_cache(const char* domain, const char* ip);// 添加到缓存
 void find_in_cache(const char* domain, char* ip);// 在缓存中查找
 void remove_from_cache(CACHE_ENTRY* entry);// 从缓存中移除条目
 void move_to_front(CACHE_ENTRY* entry);// 将条目移动到链表头部
+int forward_to_external_dns(unsigned char* request, int request_len, unsigned char* response);// 转发 DNS 请求到外部服务器并接收响应
+void parse_ip_from_response(unsigned char* response, int response_len, char* ip, int ip_size);// 从外部 DNS 响应中解析 IP 地址
 
 int main() {
     WSADATA wsaData;
@@ -254,28 +256,47 @@ DWORD WINAPI handle_client(LPVOID arg) {
     else {
         // 先从缓存中查找
         find_in_cache(domain, ip);
-        if (strlen(ip) == 0) {
-            // 缓存中未找到，在 dnsrelay.txt 文件中查找 IP
-            search_in_file(domain, ip);
-            if (strlen(ip) == 0) {
-                // 在文件中未找到，查询外部 DNS 服务器
-                query_external_dns(buffer, recv_len, ip);
-                if (strlen(ip) == 0) {//都找不到
-                    strcpy_s(ip, MAX_IP_LENGTH, "0.0.0.0"); //找不到
-                }
-                else {
-					printf("查询外部 DNS 服务器成功，域名 %s 对应的 IP: %s\n", domain, ip);
-                }
-            }
-            else {
-				printf("在文件中找到域名 %s 对应的 IP: %s\n", domain, ip);
-            }
-            // 将查询结果添加到缓存
-            add_to_cache(domain, ip);
+        if (strlen(ip) > 0) {
+            printf("从缓存中找到域名 %s 对应的 IP: %s\n", domain, ip);
+            send_dns_response(sockfd, &client_addr, client_addr_len, buffer, recv_len, ip);
         }
         else {
-            printf("从缓存中找到域名 %s 对应的 IP: %s\n", domain, ip);
-		}
+            // 缓存中未找到，在 dnsrelay.txt 文件中查找 IP
+            search_in_file(domain, ip);
+            if (strlen(ip) > 0) {
+                printf("在文件中找到域名 %s 对应的 IP: %s\n", domain, ip);
+                send_dns_response(sockfd, &client_addr, client_addr_len, buffer, recv_len, ip);
+                // 将查询结果添加到缓存
+                add_to_cache(domain, ip);
+            }
+            else {
+                // 在文件中未找到，直接转发客户端请求到外部 DNS 服务器
+                unsigned char response[BUFFER_SIZE];
+                int response_len = forward_to_external_dns(buffer, recv_len, response);
+                if (response_len > 0) {
+                    // 直接将外部 DNS 响应发送给客户端
+                    int sent_bytes = sendto(sockfd, (char*)response, response_len, 0,
+                        (struct sockaddr*)&client_addr, client_addr_len);
+                    if (sent_bytes == SOCKET_ERROR) {
+                        printf("发送响应失败: %d\n", WSAGetLastError());
+                    }
+                    else {
+                        printf("已原封不动转发外部 DNS 响应，长度: %d 字节\n", sent_bytes);
+                        // 解析外部 DNS 响应，提取 IP 并添加到缓存
+                        char resolved_ip[MAX_IP_LENGTH] = { 0 };
+                        parse_ip_from_response(response, response_len, resolved_ip, MAX_IP_LENGTH);
+                        if (strlen(resolved_ip) > 0) {
+                            add_to_cache(domain, resolved_ip);
+                            printf("已将外部 DNS 返回的 IP %s 添加到缓存\n", resolved_ip);
+                        }
+                    }
+                }
+                else {
+                    strcpy_s(ip, MAX_IP_LENGTH, "0.0.0.0"); //找不到
+                    send_dns_response(sockfd, &client_addr, client_addr_len, buffer, recv_len, ip);
+                }
+            }
+        }
     }
 
     // 发送响应
@@ -674,4 +695,144 @@ void move_to_front(CACHE_ENTRY* entry) {
     entry->prev = NULL;
     cache.head->prev = entry;
     cache.head = entry;
+}
+
+// 转发 DNS 请求到外部服务器并接收响应
+int forward_to_external_dns(unsigned char* request, int request_len, unsigned char* response) {
+    // 创建专用套接字用于外部 DNS 查询
+    SOCKET dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_sock == INVALID_SOCKET) {
+        printf("创建外部 DNS 查询套接字失败: %d\n", WSAGetLastError());
+        return -1;
+    }
+
+    struct sockaddr_in external_dns_addr;
+    memset(&external_dns_addr, 0, sizeof(external_dns_addr));
+    external_dns_addr.sin_family = AF_INET;
+    external_dns_addr.sin_port = htons(DNS_PORT);
+    inet_pton(AF_INET, EXTERNAL_DNS_SERVER, &external_dns_addr.sin_addr);
+
+    // 设置接收超时（2秒）
+    int timeout = 2000; // 2秒
+    if (setsockopt(dns_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) == SOCKET_ERROR) {
+        printf("设置接收超时失败: %d\n", WSAGetLastError());
+        closesocket(dns_sock);
+        return -1;
+    }
+
+    // 保存请求 ID 用于验证响应
+    unsigned short request_id = ((unsigned short*)request)[0];
+
+    // 最多重试3次
+    for (int attempt = 0; attempt < 3; attempt++) {
+        // 发送请求到外部 DNS 服务器
+        int sent_bytes = sendto(dns_sock, (char*)request, request_len, 0,
+            (struct sockaddr*)&external_dns_addr, sizeof(external_dns_addr));
+        if (sent_bytes == SOCKET_ERROR) {
+            printf("第 %d 次发送请求到外部 DNS 服务器失败: %d\n", attempt + 1, WSAGetLastError());
+            continue;
+        }
+        printf("第 %d 次发送请求到外部 DNS 服务器，ID: 0x%04X\n", attempt + 1, request_id);
+
+        // 接收响应
+        struct sockaddr_in from_addr;
+        int from_addr_len = sizeof(from_addr);
+        int recv_len = recvfrom(dns_sock, (char*)response, BUFFER_SIZE, 0,
+            (struct sockaddr*)&from_addr, &from_addr_len);
+
+        // 检查超时
+        if (recv_len == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            if (error == WSAETIMEDOUT) {
+                printf("外部 DNS 查询超时，尝试第 %d 次重试\n", attempt + 2);
+                continue;
+            }
+            else {
+                printf("接收外部 DNS 服务器响应失败: %d\n", error);
+                break;
+            }
+        }
+
+        // 验证响应来源和 ID
+        if (from_addr.sin_addr.s_addr != external_dns_addr.sin_addr.s_addr ||
+            from_addr.sin_port != external_dns_addr.sin_port) {
+            printf("收到来自未知来源的 DNS 数据包\n");
+            continue;
+        }
+
+        unsigned short response_id = ((unsigned short*)response)[0];
+        if (response_id != request_id) {
+            printf("收到 ID 不匹配的 DNS 响应 (请求 ID: 0x%04X, 响应 ID: 0x%04X)\n", request_id, response_id);
+            continue;
+        }
+
+        // 验证响应是否为合法 DNS 响应
+        DNS_HEADER* header = (DNS_HEADER*)response;
+        if (header->qr != 1) {
+            printf("收到的不是 DNS 响应包\n");
+            continue;
+        }
+
+        printf("成功从外部 DNS 服务器接收响应，ID: 0x%04X，长度: %d 字节\n", response_id, recv_len);
+        closesocket(dns_sock);
+        return recv_len;
+    }
+
+    closesocket(dns_sock);
+    return -1;
+}
+
+// 解析 DNS 响应中的 IP 地址
+void parse_ip_from_response(unsigned char* response, int response_len, char* ip, int ip_size) {
+    DNS_HEADER* header = (DNS_HEADER*)response;
+    unsigned short ancount = ntohs(header->ancount); // 获取回答记录数量
+
+    if (ancount == 0) {
+        ip[0] = '\0'; // 没有回答记录，返回空字符串
+        return;
+    }
+
+    // 跳过头部和问题部分
+    unsigned char* answer_section = response + sizeof(DNS_HEADER);
+    while (*answer_section != 0) {
+        answer_section++;
+    }
+    answer_section++; // 跳过问题部分的结尾零字节
+    answer_section += 4; // 跳过 QTYPE 和 QCLASS
+
+    // 遍历回答记录
+    for (int i = 0; i < ancount; i++) {
+        // 跳过域名指针
+        answer_section += 2;
+
+        // 检查记录类型是否为 A 记录（IPv4 地址）
+        unsigned short type = ntohs(*(unsigned short*)answer_section);
+        answer_section += 2;
+        if (type != 1) {
+            // 不是 A 记录，跳过该记录
+            answer_section += 2; // 跳过 CLASS
+            answer_section += 4; // 跳过 TTL
+            unsigned short rdlength = ntohs(*(unsigned short*)answer_section);
+            answer_section += 2; // 跳过 RDLENGTH
+            answer_section += rdlength; // 跳过记录数据
+            continue;
+        }
+
+        // 是 A 记录，提取 IP 地址
+        answer_section += 2; // 跳过 CLASS
+        answer_section += 4; // 跳过 TTL
+        unsigned short rdlength = ntohs(*(unsigned short*)answer_section);
+        answer_section += 2; // 跳过 RDLENGTH
+
+        if (rdlength == 4) {
+            // 提取 IPv4 地址
+            unsigned char* ip_bytes = answer_section;
+            snprintf(ip, ip_size, "%d.%d.%d.%d", ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+            return;
+        }
+
+        answer_section += rdlength; // 跳过记录数据
+    }
+
+    ip[0] = '\0'; // 未找到有效的 A 记录，返回空字符串
 }
