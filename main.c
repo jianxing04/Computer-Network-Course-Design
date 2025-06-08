@@ -820,7 +820,7 @@ void parse_ip_from_response(unsigned char* response, int response_len, const cha
 void free_ips(char** ips) {
     if (ips != NULL) {
         for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
-            if (ips[i] != NULL) {
+			if (ips[i] != NULL) {// 确保指针不为NULL
                 free(ips[i]);
             }
         }
