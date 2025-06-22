@@ -50,16 +50,17 @@ type CacheEntry struct {
 
 // 全局变量
 var (
-	mappingTable []DomainIPMapping
-	cache        []CacheEntry
-	cacheMutex   sync.Mutex
-	idMutex      sync.Mutex
-	nextID       uint16 = 1
-	externalDNS  string = "114.114.114.114"
-	debugLevel   int    = 0
-	cacheMaxSize int    = 100
-	mappingCount int
-	cacheCount   int
+	mappingTable   []DomainIPMapping
+	cache          []CacheEntry
+	cacheMutex     sync.RWMutex // 改为读写锁提高性能
+	idMutex        sync.Mutex
+	nextID         uint16 = 1
+	externalDNS    string = "114.114.114.114"
+	debugLevel     int    = 0
+	cacheMaxSize   int    = 100
+	mappingCount   int
+	cacheCount     int
+	shutdownSignal chan struct{}
 )
 
 const (
@@ -70,9 +71,14 @@ const (
 	CLASS_IN         = 1    // IN类
 	FLAG_RESPONSE    = 0x8000
 	RCODE_NAME_ERROR = 3 // 域名不存在错误码
+	MAX_DOMAIN_LEN   = 253 // 最大域名长度
 )
 
 func main() {
+	// 设置优雅关闭信号
+	shutdownSignal = make(chan struct{})
+	defer close(shutdownSignal)
+	
 	// 解析命令行参数
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -121,26 +127,55 @@ func main() {
 	// 处理客户端请求
 	buf := make([]byte, MAX_PACKET_SIZE)
 	for {
-		n, clientAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("读取数据失败: %v", err)
-			continue
-		}
+		select {
+		case <-shutdownSignal:
+			log.Println("接收到关闭信号，停止服务")
+			return
+		default:
+			n, clientAddr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				// 检查是否是超时错误
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					logDebug(1, "读取超时: %v", err)
+					continue
+				}
+				
+				logDebug(1, "读取数据失败: %v", err)
+				continue
+			}
 
-		// 处理请求
-		go handleClientRequest(conn, clientAddr, buf[:n])
+			// 处理请求
+			go handleClientRequest(conn, clientAddr, buf[:n])
+		}
 	}
 }
 
 // 处理客户端请求
 func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			logDebug(1, "处理请求时发生panic: %v", r)
+		}
+	}()
+
 	clientIP := clientAddr.IP.String()
 	logDebug(2, "收到客户端请求，IP: %s，长度: %d", clientIP, len(request))
+
+	// 验证请求长度
+	if len(request) < 12 {
+		logDebug(1, "请求过短: %d字节", len(request))
+		response := buildErrorResponse(request, RCODE_NAME_ERROR)
+		if response != nil {
+			if _, err := conn.WriteToUDP(response, clientAddr); err != nil {
+				logDebug(1, "发送错误响应失败: %v", err)
+			}
+		}
+		return
+	}
 
 	domain, qtype, err := parseDNSMessage(request)
 	if err != nil {
 		logDebug(1, "解析DNS请求失败: %v", err)
-		// 发送错误响应
 		response := buildErrorResponse(request, RCODE_NAME_ERROR)
 		if response != nil {
 			if _, err := conn.WriteToUDP(response, clientAddr); err != nil {
@@ -214,6 +249,11 @@ func parseDNSMessage(buffer []byte) (string, uint16, error) {
 		return "", 0, err
 	}
 
+	// 验证域名长度
+	if len(domain) > MAX_DOMAIN_LEN {
+		return "", 0, fmt.Errorf("域名过长: %d字符", len(domain))
+	}
+
 	// 跳过问题部分
 	pos := 12 + len(domain) + 1 + 4 // 头部 + 域名 + 结束符 + QTYPE/QCLASS
 
@@ -236,10 +276,19 @@ func parseDNSMessage(buffer []byte) (string, uint16, error) {
 func parseDomainName(buffer []byte, offset int) (string, error) {
 	var parts []string
 	pos := offset
+	visited := make(map[int]bool) // 防止指针循环
+	maxDepth := 10                // 最大递归深度
+	depth := 0
 
 	for {
 		if pos >= len(buffer) {
 			return "", errors.New("无效的域名偏移")
+		}
+
+		// 防止无限递归
+		depth++
+		if depth > maxDepth {
+			return "", errors.New("域名解析递归深度过大")
 		}
 
 		length := int(buffer[pos])
@@ -249,12 +298,21 @@ func parseDomainName(buffer []byte, offset int) (string, error) {
 			break // 域名结束
 		}
 
+		// 检查指针循环
+		if visited[pos] {
+			return "", errors.New("检测到域名指针循环")
+		}
+		visited[pos] = true
+
 		if length&0xC0 == 0xC0 { // 指针
 			if pos >= len(buffer) {
 				return "", errors.New("无效的域名指针")
 			}
 			pointer := int(binary.BigEndian.Uint16([]byte{byte(length & 0x3F), buffer[pos]}))
 			pos++
+			if pointer >= len(buffer) {
+				return "", errors.New("域名指针越界")
+			}
 			part, err := parseDomainName(buffer, pointer)
 			if err != nil {
 				return "", err
@@ -320,6 +378,13 @@ func buildDNSResponse(request []byte, ip string, rcode int) []byte {
 		logDebug(1, "构建资源记录失败")
 		return nil
 	}
+	
+	// 确保响应缓冲区足够大
+	if len(response)+len(rr) > MAX_PACKET_SIZE {
+		logDebug(1, "响应过大，无法添加资源记录")
+		return response
+	}
+	
 	return append(response, rr...)
 }
 
@@ -418,13 +483,18 @@ func lookupMapping(domain string) (string, bool) {
 
 // 查找缓存
 func lookupCache(domain string) (string, bool) {
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
+	cacheMutex.RLock() // 读锁
+	defer cacheMutex.RUnlock()
 
 	now := time.Now()
 	for i := 0; i < cacheCount; i++ {
-		if cache[i].Domain == domain && now.Before(cache[i].Timestamp.Add(time.Duration(cache[i].TTL)*time.Second)) {
-			return cache[i].IP, true
+		if cache[i].Domain == domain {
+			// 检查是否过期
+			if now.Before(cache[i].Timestamp.Add(time.Duration(cache[i].TTL) * time.Second)) {
+				return cache[i].IP, true
+			}
+			// 过期项
+			return "", false
 		}
 	}
 	return "", false
@@ -498,6 +568,10 @@ func sendDNSQuery(domain string, qtype uint16) (string, error) {
 	response := make([]byte, MAX_PACKET_SIZE)
 	n, err := conn.Read(response)
 	if err != nil {
+		// 检查超时
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return "", errors.New("DNS查询超时")
+		}
 		return "", fmt.Errorf("接收DNS响应失败: %v", err)
 	}
 
@@ -529,6 +603,12 @@ func buildDNSQuery(domain string, qtype uint16) []byte {
 	// 域名
 	labels := strings.Split(domain, ".")
 	for _, label := range labels {
+		// 验证标签长度
+		if len(label) > 63 {
+			logDebug(1, "域名标签过长: %s", label)
+			return nil
+		}
+		
 		err := buf.WriteByte(byte(len(label)))
 		if err != nil {
 			logDebug(1, "写入DNS查询域名标签长度失败: %v", err)
@@ -600,6 +680,9 @@ func parseDNSResponse(response []byte) (string, error) {
 			pos += 2
 		} else { // 标准名称
 			for response[pos] != 0 {
+				if pos >= len(response) {
+					return "", errors.New("域名解析越界")
+				}
 				length := int(response[pos])
 				pos += 1 + length
 			}
@@ -655,7 +738,9 @@ func parseMappingFile(filename string) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 
@@ -666,6 +751,7 @@ func parseMappingFile(filename string) {
 
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
+			logDebug(1, "无效的行格式: %s (行 %d)", line, lineNum)
 			continue
 		}
 
@@ -674,7 +760,13 @@ func parseMappingFile(filename string) {
 
 		// 检查IP地址是否有效
 		if net.ParseIP(ip) == nil {
-			logDebug(1, "无效的IP地址: %s 在映射文件 %s 中", ip, filename)
+			logDebug(1, "无效的IP地址: %s 在映射文件 %s 行 %d", ip, filename, lineNum)
+			continue
+		}
+
+		// 验证域名格式
+		if len(domain) > MAX_DOMAIN_LEN {
+			logDebug(1, "域名过长: %s (行 %d)", domain, lineNum)
 			continue
 		}
 
@@ -686,6 +778,10 @@ func parseMappingFile(filename string) {
 		mappingCount++
 	}
 
+	if err := scanner.Err(); err != nil {
+		logDebug(1, "读取映射文件失败: %v", err)
+	}
+
 	logDebug(1, "解析映射文件 %s，共 %d 条记录", filename, mappingCount)
 }
 
@@ -695,7 +791,7 @@ func logDebug(level int, format string, args ...interface{}) {
 		return
 	}
 
-	timestamp := time.Now().Format("15:04:05")
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("[%s] %s", timestamp, msg)
 }
