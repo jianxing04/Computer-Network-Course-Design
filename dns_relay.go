@@ -70,7 +70,7 @@ const (
 	TYPE_A           = 1    // A记录类型
 	CLASS_IN         = 1    // IN类
 	FLAG_RESPONSE    = 0x8000
-	RCODE_NAME_ERROR = 3 // 域名不存在错误码
+	RCODE_NAME_ERROR = 3   // 域名不存在错误码
 	MAX_DOMAIN_LEN   = 253 // 最大域名长度
 )
 
@@ -78,7 +78,7 @@ func main() {
 	// 设置优雅关闭信号
 	shutdownSignal = make(chan struct{})
 	defer close(shutdownSignal)
-	
+
 	// 解析命令行参数
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -139,7 +139,7 @@ func main() {
 					logDebug(1, "读取超时: %v", err)
 					continue
 				}
-				
+
 				logDebug(1, "读取数据失败: %v", err)
 				continue
 			}
@@ -173,7 +173,7 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 		return
 	}
 
-	domain, qtype, err := parseDNSMessage(request)
+	domain, qtype, consumed, err := parseDNSMessage(request)
 	if err != nil {
 		logDebug(1, "解析DNS请求失败: %v", err)
 		response := buildErrorResponse(request, RCODE_NAME_ERROR)
@@ -207,7 +207,10 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 		} else {
 			// 转发到外部DNS服务器
 			logDebug(1, "转发查询: %s", domain)
-			if relayedIP, err := sendDNSQuery(domain, qtype); err == nil {
+			if relayedIP, err := func() (string, error) {
+				var _ int = consumed
+				return sendDNSQuery(domain, qtype)
+			}(); err == nil {
 				ip = relayedIP
 				logDebug(2, "转发成功: %s -> %s", domain, ip)
 				addToCache(domain, ip, DEFAULT_TTL)
@@ -230,9 +233,9 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 }
 
 // 解析DNS报文
-func parseDNSMessage(buffer []byte) (string, uint16, error) {
+func parseDNSMessage(buffer []byte) (string, uint16, int, error) {
 	if len(buffer) < 12 {
-		return "", 0, errors.New("报文过短")
+		return "", 0, 0, errors.New("报文过短")
 	}
 
 	// 解析头部
@@ -240,96 +243,91 @@ func parseDNSMessage(buffer []byte) (string, uint16, error) {
 	reader := bytes.NewReader(buffer)
 	err := binary.Read(reader, binary.BigEndian, &header)
 	if err != nil {
-		return "", 0, fmt.Errorf("解析DNS头部失败: %v", err)
+		return "", 0, 0, fmt.Errorf("解析DNS头部失败: %v", err)
 	}
 
-	// 解析域名
-	domain, err := parseDomainName(buffer, 12)
+	// 解析域名并获取实际消耗字节数
+	domain, consumed, err := parseDomainName(buffer, 12)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 
 	// 验证域名长度
 	if len(domain) > MAX_DOMAIN_LEN {
-		return "", 0, fmt.Errorf("域名过长: %d字符", len(domain))
+		return "", 0, 0, fmt.Errorf("域名过长: %d字符", len(domain))
 	}
 
-	// 跳过问题部分
-	pos := 12 + len(domain) + 1 + 4 // 头部 + 域名 + 结束符 + QTYPE/QCLASS
-
-	// 检查是否越界
-	if pos+4 > len(buffer) {
-		return "", 0, errors.New("无效的DNS查询，可能越界")
+	// 计算问题部分结束位置
+	pos := 12 + consumed
+	if pos+4 > len(buffer) { // QTYPE(2) + QCLASS(2)
+		return "", 0, 0, errors.New("DNS查询问题部分不完整")
 	}
 
 	// 解析查询类型
 	qtype := binary.BigEndian.Uint16(buffer[pos:])
-	pos += 2
-	//class := binary.BigEndian.Uint16(buffer[pos:])
 
-	logDebug(3, "解析域名: %s, 类型: %d", domain, qtype)
+	logDebug(3, "解析域名: %s, 类型: %d, 消耗字节: %d", domain, qtype, consumed)
 
-	return domain, qtype, nil
+	return domain, qtype, consumed, nil
 }
 
-// 解析域名
-func parseDomainName(buffer []byte, offset int) (string, error) {
+// 解析域名 (返回域名、消耗字节数和错误)
+func parseDomainName(buffer []byte, offset int) (string, int, error) {
 	var parts []string
 	pos := offset
-	visited := make(map[int]bool) // 防止指针循环
-	maxDepth := 10                // 最大递归深度
+	totalBytes := 0 // 记录实际消耗字节数
+	maxDepth := 10  // 最大递归深度
 	depth := 0
 
 	for {
 		if pos >= len(buffer) {
-			return "", errors.New("无效的域名偏移")
+			return "", totalBytes, errors.New("域名解析越界")
 		}
 
 		// 防止无限递归
 		depth++
 		if depth > maxDepth {
-			return "", errors.New("域名解析递归深度过大")
+			return "", totalBytes, errors.New("域名解析递归深度过大")
 		}
 
 		length := int(buffer[pos])
 		pos++
+		totalBytes++
 
 		if length == 0 {
 			break // 域名结束
 		}
 
-		// 检查指针循环
-		if visited[pos] {
-			return "", errors.New("检测到域名指针循环")
-		}
-		visited[pos] = true
-
-		if length&0xC0 == 0xC0 { // 指针
+		// 处理指针 (0xC0开头)
+		if length&0xC0 == 0xC0 {
 			if pos >= len(buffer) {
-				return "", errors.New("无效的域名指针")
+				return "", totalBytes, errors.New("无效的域名指针")
 			}
+
 			pointer := int(binary.BigEndian.Uint16([]byte{byte(length & 0x3F), buffer[pos]}))
 			pos++
-			if pointer >= len(buffer) {
-				return "", errors.New("域名指针越界")
-			}
-			part, err := parseDomainName(buffer, pointer)
+			totalBytes++
+
+			// 递归解析指针指向的域名
+			part, _, err := parseDomainName(buffer, pointer)
 			if err != nil {
-				return "", err
+				return "", totalBytes, err
 			}
 			parts = append(parts, part)
 			break
 		}
 
+		// 处理普通标签
 		if pos+length > len(buffer) {
-			return "", errors.New("域名超出范围")
+			return "", totalBytes, errors.New("域名标签超出范围")
 		}
 
 		parts = append(parts, string(buffer[pos:pos+length]))
 		pos += length
+		totalBytes += length
 	}
 
-	return strings.Join(parts, "."), nil
+	return strings.Join(parts, "."), totalBytes, nil
 }
 
 // 构建DNS响应
@@ -378,13 +376,13 @@ func buildDNSResponse(request []byte, ip string, rcode int) []byte {
 		logDebug(1, "构建资源记录失败")
 		return nil
 	}
-	
+
 	// 确保响应缓冲区足够大
 	if len(response)+len(rr) > MAX_PACKET_SIZE {
 		logDebug(1, "响应过大，无法添加资源记录")
 		return response
 	}
-	
+
 	return append(response, rr...)
 }
 
@@ -608,7 +606,7 @@ func buildDNSQuery(domain string, qtype uint16) []byte {
 			logDebug(1, "域名标签过长: %s", label)
 			return nil
 		}
-		
+
 		err := buf.WriteByte(byte(len(label)))
 		if err != nil {
 			logDebug(1, "写入DNS查询域名标签长度失败: %v", err)
@@ -663,11 +661,11 @@ func parseDNSResponse(response []byte) (string, error) {
 
 	// 跳过问题部分
 	pos := 12
-	domain, err := parseDomainName(response, pos)
+	domain, _, err := parseDomainName(response, pos)
 	if err != nil {
 		return "", err
 	}
-	pos += len(domain) + 1 + 4 // 域名 + 结束符 + QTYPE/QCLASS
+	pos += 12 // 跳过问题部分 (域名+类型+类)
 
 	// 解析回答部分
 	for i := 0; i < int(header.ANCount); i++ {
