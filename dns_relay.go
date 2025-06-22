@@ -55,7 +55,7 @@ var (
 	cacheMutex   sync.Mutex
 	idMutex      sync.Mutex
 	nextID       uint16 = 1
-	externalDNS  string = "202.106.0.20"
+	externalDNS  string = "114.114.114.114"
 	debugLevel   int    = 0
 	cacheMaxSize int    = 100
 	mappingCount int
@@ -140,6 +140,13 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 	domain, qtype, err := parseDNSMessage(request)
 	if err != nil {
 		logDebug(1, "解析DNS请求失败: %v", err)
+		// 发送错误响应
+		response := buildErrorResponse(request, RCODE_NAME_ERROR)
+		if response != nil {
+			if _, err := conn.WriteToUDP(response, clientAddr); err != nil {
+				logDebug(1, "发送错误响应失败: %v", err)
+			}
+		}
 		return
 	}
 
@@ -196,7 +203,10 @@ func parseDNSMessage(buffer []byte) (string, uint16, error) {
 	// 解析头部
 	header := DNSHeader{}
 	reader := bytes.NewReader(buffer)
-	binary.Read(reader, binary.BigEndian, &header)
+	err := binary.Read(reader, binary.BigEndian, &header)
+	if err != nil {
+		return "", 0, fmt.Errorf("解析DNS头部失败: %v", err)
+	}
 
 	// 解析域名
 	domain, err := parseDomainName(buffer, 12)
@@ -207,11 +217,12 @@ func parseDNSMessage(buffer []byte) (string, uint16, error) {
 	// 跳过问题部分
 	pos := 12 + len(domain) + 1 + 4 // 头部 + 域名 + 结束符 + QTYPE/QCLASS
 
-	// 解析查询类型
+	// 检查是否越界
 	if pos+4 > len(buffer) {
-		return "", 0, errors.New("无效的DNS查询")
+		return "", 0, errors.New("无效的DNS查询，可能越界")
 	}
 
+	// 解析查询类型
 	qtype := binary.BigEndian.Uint16(buffer[pos:])
 	pos += 2
 	//class := binary.BigEndian.Uint16(buffer[pos:])
@@ -276,7 +287,11 @@ func buildDNSResponse(request []byte, ip string, rcode int) []byte {
 	// 修改头部
 	header := DNSHeader{}
 	reader := bytes.NewReader(response[:12])
-	binary.Read(reader, binary.BigEndian, &header)
+	err := binary.Read(reader, binary.BigEndian, &header)
+	if err != nil {
+		logDebug(1, "解析DNS响应头部失败: %v", err)
+		return nil
+	}
 
 	header.Flags |= FLAG_RESPONSE // 设置为响应
 	header.Flags &= 0xFFF0        // 清除响应码
@@ -287,7 +302,11 @@ func buildDNSResponse(request []byte, ip string, rcode int) []byte {
 	}
 
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, header)
+	err = binary.Write(buf, binary.BigEndian, header)
+	if err != nil {
+		logDebug(1, "写入DNS响应头部失败: %v", err)
+		return nil
+	}
 	copy(response[:12], buf.Bytes())
 
 	// 如果没有IP或存在错误，直接返回
@@ -297,7 +316,46 @@ func buildDNSResponse(request []byte, ip string, rcode int) []byte {
 
 	// 构建资源记录
 	rr := buildResourceRecord(ip)
+	if rr == nil {
+		logDebug(1, "构建资源记录失败")
+		return nil
+	}
 	return append(response, rr...)
+}
+
+// 构建错误响应
+func buildErrorResponse(request []byte, rcode int) []byte {
+	if len(request) < 12 {
+		return nil
+	}
+
+	// 复制请求报文
+	response := make([]byte, len(request))
+	copy(response, request)
+
+	// 修改头部
+	header := DNSHeader{}
+	reader := bytes.NewReader(response[:12])
+	err := binary.Read(reader, binary.BigEndian, &header)
+	if err != nil {
+		logDebug(1, "解析错误响应头部失败: %v", err)
+		return nil
+	}
+
+	header.Flags |= FLAG_RESPONSE // 设置为响应
+	header.Flags &= 0xFFF0        // 清除响应码
+	header.Flags |= uint16(rcode) // 设置响应码
+	header.ANCount = 0            // 无回答
+
+	buf := new(bytes.Buffer)
+	err = binary.Write(buf, binary.BigEndian, header)
+	if err != nil {
+		logDebug(1, "写入错误响应头部失败: %v", err)
+		return nil
+	}
+	copy(response[:12], buf.Bytes())
+
+	return response
 }
 
 // 构建资源记录
@@ -309,20 +367,41 @@ func buildResourceRecord(ip string) []byte {
 	buf.WriteByte(0x0C) // 指向请求中域名的位置
 
 	// 类型 (A记录)
-	binary.Write(buf, binary.BigEndian, uint16(TYPE_A))
+	err := binary.Write(buf, binary.BigEndian, uint16(TYPE_A))
+	if err != nil {
+		logDebug(1, "写入资源记录类型失败: %v", err)
+		return nil
+	}
 	// 类 (IN)
-	binary.Write(buf, binary.BigEndian, uint16(CLASS_IN))
+	err = binary.Write(buf, binary.BigEndian, uint16(CLASS_IN))
+	if err != nil {
+		logDebug(1, "写入资源记录类失败: %v", err)
+		return nil
+	}
 	// TTL (1小时)
-	binary.Write(buf, binary.BigEndian, uint32(DEFAULT_TTL))
+	err = binary.Write(buf, binary.BigEndian, uint32(DEFAULT_TTL))
+	if err != nil {
+		logDebug(1, "写入资源记录TTL失败: %v", err)
+		return nil
+	}
 	// 数据长度 (IPv4地址)
-	binary.Write(buf, binary.BigEndian, uint16(4))
+	err = binary.Write(buf, binary.BigEndian, uint16(4))
+	if err != nil {
+		logDebug(1, "写入资源记录数据长度失败: %v", err)
+		return nil
+	}
 
 	// IP地址
 	ipBytes := net.ParseIP(ip).To4()
 	if ipBytes == nil {
+		logDebug(1, "无效的IP地址: %s", ip)
 		return nil
 	}
-	buf.Write(ipBytes)
+	_, err = buf.Write(ipBytes)
+	if err != nil {
+		logDebug(1, "写入资源记录IP地址失败: %v", err)
+		return nil
+	}
 
 	return buf.Bytes()
 }
@@ -399,7 +478,7 @@ func sendDNSQuery(domain string, qtype uint16) (string, error) {
 	// 创建UDP连接
 	conn, err := net.Dial("udp", externalDNS+":53")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("连接外部DNS服务器失败: %v", err)
 	}
 	defer conn.Close()
 
@@ -408,21 +487,24 @@ func sendDNSQuery(domain string, qtype uint16) (string, error) {
 
 	// 构建查询
 	query := buildDNSQuery(domain, qtype)
+	if query == nil {
+		return "", errors.New("构建DNS查询失败")
+	}
 	if _, err := conn.Write(query); err != nil {
-		return "", err
+		return "", fmt.Errorf("发送DNS查询失败: %v", err)
 	}
 
 	// 接收响应
 	response := make([]byte, MAX_PACKET_SIZE)
 	n, err := conn.Read(response)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("接收DNS响应失败: %v", err)
 	}
 
 	// 解析响应
 	ip, err := parseDNSResponse(response[:n])
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("解析DNS响应失败: %v", err)
 	}
 
 	return ip, nil
@@ -438,19 +520,43 @@ func buildDNSQuery(domain string, qtype uint16) []byte {
 		Flags:   0x0100, // 标准查询
 		QDCount: 1,
 	}
-	binary.Write(buf, binary.BigEndian, header)
+	err := binary.Write(buf, binary.BigEndian, header)
+	if err != nil {
+		logDebug(1, "写入DNS查询头部失败: %v", err)
+		return nil
+	}
 
 	// 域名
 	labels := strings.Split(domain, ".")
 	for _, label := range labels {
-		buf.WriteByte(byte(len(label)))
-		buf.WriteString(label)
+		err := buf.WriteByte(byte(len(label)))
+		if err != nil {
+			logDebug(1, "写入DNS查询域名标签长度失败: %v", err)
+			return nil
+		}
+		_, err = buf.WriteString(label)
+		if err != nil {
+			logDebug(1, "写入DNS查询域名标签失败: %v", err)
+			return nil
+		}
 	}
-	buf.WriteByte(0) // 结束符
+	err = buf.WriteByte(0) // 结束符
+	if err != nil {
+		logDebug(1, "写入DNS查询域名结束符失败: %v", err)
+		return nil
+	}
 
 	// 查询类型和类
-	binary.Write(buf, binary.BigEndian, qtype)
-	binary.Write(buf, binary.BigEndian, uint16(CLASS_IN))
+	err = binary.Write(buf, binary.BigEndian, qtype)
+	if err != nil {
+		logDebug(1, "写入DNS查询类型失败: %v", err)
+		return nil
+	}
+	err = binary.Write(buf, binary.BigEndian, uint16(CLASS_IN))
+	if err != nil {
+		logDebug(1, "写入DNS查询类失败: %v", err)
+		return nil
+	}
 
 	return buf.Bytes()
 }
@@ -464,7 +570,10 @@ func parseDNSResponse(response []byte) (string, error) {
 	// 解析头部
 	header := DNSHeader{}
 	reader := bytes.NewReader(response[:12])
-	binary.Read(reader, binary.BigEndian, &header)
+	err := binary.Read(reader, binary.BigEndian, &header)
+	if err != nil {
+		return "", fmt.Errorf("解析DNS响应头部失败: %v", err)
+	}
 
 	// 检查响应码
 	rcode := header.Flags & 0x000F
@@ -484,7 +593,7 @@ func parseDNSResponse(response []byte) (string, error) {
 	for i := 0; i < int(header.ANCount); i++ {
 		// 跳过名称 (可能是指针)
 		if pos+2 > len(response) {
-			return "", errors.New("无效的响应")
+			return "", errors.New("无效的响应，可能越界")
 		}
 
 		if response[pos]&0xC0 == 0xC0 { // 指针
@@ -498,7 +607,7 @@ func parseDNSResponse(response []byte) (string, error) {
 		}
 
 		if pos+10 > len(response) {
-			return "", errors.New("无效的资源记录")
+			return "", errors.New("无效的资源记录，可能越界")
 		}
 
 		// 解析资源记录
@@ -513,7 +622,7 @@ func parseDNSResponse(response []byte) (string, error) {
 
 		if rrType == TYPE_A && rdLength == 4 {
 			if pos+4 > len(response) {
-				return "", errors.New("无效的IP地址")
+				return "", errors.New("无效的IP地址，可能越界")
 			}
 
 			ip := net.IPv4(response[pos], response[pos+1], response[pos+2], response[pos+3]).String()
@@ -562,6 +671,12 @@ func parseMappingFile(filename string) {
 
 		ip := parts[0]
 		domain := parts[1]
+
+		// 检查IP地址是否有效
+		if net.ParseIP(ip) == nil {
+			logDebug(1, "无效的IP地址: %s 在映射文件 %s 中", ip, filename)
+			continue
+		}
 
 		// 添加到映射表
 		mappingTable = append(mappingTable, DomainIPMapping{
