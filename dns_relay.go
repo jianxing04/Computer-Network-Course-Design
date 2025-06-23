@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -80,26 +83,30 @@ const (
 func main() {
 	shutdownSignal = make(chan struct{})
 	defer close(shutdownSignal)
-	
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-d":
-			debugLevel = 1
-			if i+1 < len(args) {
-				externalDNS = args[i+1]
-				i++
-			}
-		case "-dd":
-			debugLevel = 2
-			if i+1 < len(args) {
-				externalDNS = args[i+1]
-				i++
-			}
-		default:
-			if strings.HasSuffix(args[i], ".txt") {
-				parseMappingFile(args[i])
-			}
+
+	// 创建一个信号通道，用于接收操作系统信号
+	sigChan := make(chan os.Signal, 1)
+	// 监听 SIGINT（Ctrl+C）和 SIGTERM 信号
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 定义命令行标志
+	debugLevelFlag := flag.Int("debug", 0, "调试等级 (0: 无调试信息, 1: 基本调试信息, 2: 详细调试信息)")
+	externalDNSFlag := flag.String("dns", "114.114.114.114", "外部 DNS 服务器地址")
+	mappingFilesFlag := flag.String("mapping", "dnsrelay.txt", "域名-IP 映射文件，多个文件用逗号分隔")
+
+	// 解析命令行标志
+	flag.Parse()
+
+	// 设置全局变量
+	debugLevel = *debugLevelFlag
+	externalDNS = *externalDNSFlag
+
+	// 解析映射文件
+	mappingFiles := strings.Split(*mappingFilesFlag, ",")
+	for _, file := range mappingFiles {
+		file = strings.TrimSpace(file)
+		if file != "" {
+			parseMappingFile(file)
 		}
 	}
 
@@ -123,6 +130,15 @@ func main() {
 	log.Printf("DNS中继服务器启动，监听端口%d，外部DNS服务器: %s", DNS_PORT, externalDNS)
 
 	buf := make([]byte, MAX_PACKET_SIZE)
+
+	go func() {
+		// 监听信号通道
+		sig := <-sigChan
+		log.Printf("接收到信号: %v，停止服务", sig)
+		// 往 shutdownSignal 通道发送信号
+		close(shutdownSignal)
+	}()
+
 	for {
 		select {
 		case <-shutdownSignal:
@@ -289,7 +305,7 @@ func parseDomainName(buffer []byte, offset int) (string, int, error) {
 			if pos >= len(buffer) {
 				return "", totalBytes, errors.New("无效的域名指针")
 			}
-			
+
 			pointer := int(binary.BigEndian.Uint16([]byte{byte(length & 0x3F), buffer[pos]}))
 			pos++
 			totalBytes++
@@ -305,7 +321,7 @@ func parseDomainName(buffer []byte, offset int) (string, int, error) {
 		if pos+length > len(buffer) {
 			return "", totalBytes, errors.New("域名标签超出范围")
 		}
-		
+
 		parts = append(parts, string(buffer[pos:pos+length]))
 		pos += length
 		totalBytes += length
@@ -355,12 +371,12 @@ func buildDNSResponse(request []byte, ip string, rcode int, qtype uint16) []byte
 		logDebug(1, "构建资源记录失败")
 		return nil
 	}
-	
+
 	if len(response)+len(rr) > MAX_PACKET_SIZE {
 		logDebug(1, "响应过大，无法添加资源记录")
 		return response
 	}
-	
+
 	return append(response, rr...)
 }
 
@@ -574,7 +590,7 @@ func buildDNSQuery(domain string, qtype uint16) []byte {
 			logDebug(1, "域名标签过长: %s", label)
 			return nil
 		}
-		
+
 		err := buf.WriteByte(byte(len(label)))
 		if err != nil {
 			logDebug(1, "写入DNS查询域名标签长度失败: %v", err)
@@ -634,7 +650,7 @@ func parseDNSResponse(response []byte, qtype uint16) (string, error) {
 		if pos >= len(response) {
 			return "", errors.New("响应越界")
 		}
-		
+
 		// 处理名称字段
 		if response[pos]&0xC0 == 0xC0 {
 			pos += 2
