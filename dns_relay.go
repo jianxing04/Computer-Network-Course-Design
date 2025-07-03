@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -15,94 +16,72 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	
+	"github.com/fsnotify/fsnotify"
 )
-
-// +---------------------+
-// |        头部         |
-// +---------------------+
-// |       问题部分      |
-// +---------------------+
-// |      回答部分       |
-// +---------------------+
-// |      授权部分       |
-// +---------------------+
-// |      附加部分       |
-// +---------------------+
 
 // DNS报文头部结构
 type DNSHeader struct {
-	ID      uint16
-	Flags   uint16
-	QDCount uint16
-	ANCount uint16
-	NSCount uint16
-	ARCount uint16
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  ID                           | 2 字节
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |QR| Opcode |AA|TC|RD|RA| Z | RCODE |            | 2 字节（标志 Flags）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  QDCOUNT                      | 2 字节（问题数）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  ANCOUNT                      | 2 字节（回答数）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  NSCOUNT                      | 2 字节（授权记录数）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  ARCOUNT                      | 2 字节（附加记录数）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+	ID      uint16 // 请求ID
+	Flags   uint16 // 标志位
+	QDCount uint16 // 问题数
+	ANCount uint16 // 回答数
+	NSCount uint16 // 授权记录数
+	ARCount uint16 // 附加记录数
 }
 
-// 资源记录结构
+// 资源记录结构，即应答部分
 type ResourceRecord struct {
-	Name     []byte
-	Type     uint16
-	Class    uint16
-	TTL      uint32
-	RDLength uint16
-	RData    []byte
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  NAME                         |  可变长度，域名（标签编码或压缩指针）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  TYPE                         |  2 字节，记录类型（如 A、AAAA、CNAME 等）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  CLASS                        |  2 字节，记录类（通常为 IN）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  TTL                          |  4 字节，生存时间（秒）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |               RDLENGTH                        |  2 字节，RDATA 部分长度
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |               RDATA                           |  可变长度，具体资源数据
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+	Name     []byte // 域名
+	Type     uint16 // 记录类型
+	Class    uint16 // 记录类
+	TTL      uint32 // 生存时间
+	RDLength uint16 // RDATA 部分长度
+	RData    []byte // 具体资源数据，即 IP 地址等
 }
 
 // 域名-IP映射
 type DomainIPMapping struct {
 	Domain string
-	IPs    []string // 修改为支持多个IP
+	IPs    []string // 支持多个IP
 }
 
 // 缓存项
 type CacheEntry struct {
-	Domain    string
-	IPs       []string // 修改为支持多个IP
-	TTL       uint32
-	Timestamp time.Time
+	Domain  string
+	IPs     []string
+	TTL     uint32
+	Expires time.Time // 修复：统一使用 Expires 字段
+}
+
+// LRU缓存结构
+type LRUCache struct {
+	capacity int
+	list     *list.List
+	cache    map[string]*list.Element
+	mutex    sync.RWMutex
+}
+
+// 工作请求结构
+type WorkRequest struct {
+	conn      *net.UDPConn
+	clientAddr *net.UDPAddr
+	data      []byte
 }
 
 // 全局变量
 var (
 	mappingTable   []DomainIPMapping
-	cache          []CacheEntry
-	cacheMutex     sync.RWMutex
+	cache          *LRUCache
 	idMutex        sync.Mutex
 	nextID         uint16 = 1
 	externalDNS    string = "114.114.114.114"
 	defaultMapping string = "dnsrelay.txt"
 	debugLevel     int    = 0
-	cacheMaxSize   int    = 100
-	mappingCount   int
-	cacheCount     int
+	workerPoolSize int    = 100
 	shutdownSignal chan struct{}
+	watcher        *fsnotify.Watcher
+	fileMutex      sync.RWMutex
 )
 
 // DNS相关常量
@@ -115,47 +94,47 @@ const (
 	TYPE_PTR         = 12     // PTR记录
 	CLASS_IN         = 1      // IN类
 	FLAG_RESPONSE    = 0x8000 // 响应标志
+	RCODE_NO_ERROR   = 0      // 无错误
+	RCODE_FORMERR    = 1      // 格式错误
 	RCODE_NAME_ERROR = 3      // 名称错误
 	RCODE_NOT_IMP    = 4      // 未实现
 	MAX_DOMAIN_LEN   = 253    // 最大域名长度
+	CACHE_CAPACITY   = 500    // 缓存容量
 )
 
 func main() {
-	shutdownSignal = make(chan struct{})
-	defer close(shutdownSignal)
-
-	// 创建一个信号通道，用于接收操作系统信号
+	// 创建信号通道
 	sigChan := make(chan os.Signal, 1)
-	// 监听 SIGINT（Ctrl+C）和 SIGTERM 信号
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// 定义命令行标志
-	debugLevelFlag := flag.Int("debug", 0, "调试等级 (0: 无调试信息, 1: 基本调试信息, 2: 详细调试信息)")
+	debugLevelFlag := flag.Int("debug", 0, "调试等级 (0-2)")
 	externalDNSFlag := flag.String("dns", "114.114.114.114", "外部 DNS 服务器地址")
-	mappingFilesFlag := flag.String("mapping", defaultMapping, "域名-IP 映射文件，多个文件用逗号分隔")
+	mappingFilesFlag := flag.String("mapping", defaultMapping, "域名-IP 映射文件")
+	workersFlag := flag.Int("workers", 100, "工作线程数量")
 
 	// 解析命令行标志
 	flag.Parse()
-
-	// 设置全局变量
 	debugLevel = *debugLevelFlag
 	externalDNS = *externalDNSFlag
+	workerPoolSize = *workersFlag
+
+	// 初始化缓存
+	cache = NewLRUCache(CACHE_CAPACITY)
+
+	// 创建文件监视器
+	var err error
+	watcher, err = fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("创建文件监视器失败: %v", err)
+	}
+	defer watcher.Close()
 
 	// 解析映射文件
-	mappingFiles := strings.Split(*mappingFilesFlag, ",")
-	for _, file := range mappingFiles {
-		file = strings.TrimSpace(file)
-		if file != "" {
-			parseMappingFile(file)
-		}
-	}
+	parseMappingFile(*mappingFilesFlag)
+	watchConfigFile(*mappingFilesFlag)
 
-	if mappingCount == 0 {
-		parseMappingFile(defaultMapping)
-	}
-
-	cache = make([]CacheEntry, cacheMaxSize)
-
+	// 创建UDP监听
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", DNS_PORT))
 	if err != nil {
 		log.Fatalf("解析地址失败: %v", err)
@@ -167,68 +146,78 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Printf("DNS中继服务器启动，监听端口%d，外部DNS服务器: %s", DNS_PORT, externalDNS)
+	log.Printf("DNS中继服务器启动，端口: %d, 外部DNS: %s, 工作线程: %d", DNS_PORT, externalDNS, workerPoolSize)
 
-	buf := make([]byte, MAX_PACKET_SIZE)
+	// 创建工作池
+	shutdownSignal = make(chan struct{})
+	workChan := make(chan WorkRequest, 1000)
+	for i := 0; i < workerPoolSize; i++ {
+		go worker(workChan)
+	}
 
+	// 启动信号监听协程
 	go func() {
-		// 监听信号通道
 		sig := <-sigChan
 		log.Printf("接收到信号: %v，停止服务", sig)
-		// 往 shutdownSignal 通道发送信号
 		close(shutdownSignal)
+		conn.Close()
 	}()
 
+	// 主处理循环
+	buf := make([]byte, MAX_PACKET_SIZE)
 	for {
-		select {
-		case <-shutdownSignal:
-			log.Println("接收到关闭信号，停止服务")
-			return
-		default:
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, clientAddr, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					// 检查是否收到关闭信号
-					select {
-					case <-shutdownSignal:
-						log.Println("接收到关闭信号，停止服务")
-						return
-					default:
-						logDebug(1, "读取超时: %v", err)
-						continue
-					}
-				}
+		n, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-shutdownSignal:
+				log.Println("服务已停止")
+				return
+			default:
 				logDebug(1, "读取数据失败: %v", err)
 				continue
 			}
+		}
 
-			go func() {
-				select {
-				case <-shutdownSignal:
-					return
-				default:
-					handleClientRequest(conn, clientAddr, buf[:n])
-				}
-			}()
+		// 复制数据以避免覆盖
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		select {
+		case <-shutdownSignal:
+			log.Println("停止处理新请求")
+			return
+		case workChan <- WorkRequest{conn, clientAddr, data}:
+		default:
+			logDebug(1, "工作队列已满，丢弃请求")
 		}
 	}
 }
 
 func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte) {
+	// 在函数开头立即检查关闭信号
+	select {
+	case <-shutdownSignal:
+		return // 已经收到了关闭信号，直接退出不处理
+	default:
+		// 没有收到关闭信号，继续处理
+	}
+
+	// 使用defer捕获panic，避免程序崩溃
 	defer func() {
 		if r := recover(); r != nil {
 			logDebug(1, "处理请求时发生panic: %v", r)
 		}
 	}()
 
+	// 解析客户端请求的IP地址和请求长度
 	clientIP := clientAddr.IP.String()
 	logDebug(2, "收到客户端请求，IP: %s，长度: %d", clientIP, len(request))
 
+	// 先检查请求长度是否足够
 	if len(request) < 12 { // DNS报文头部至少需要12字节
 		logDebug(1, "请求过短: %d字节", len(request))
-		response := buildErrorResponse(request, RCODE_NAME_ERROR) // 报文头部RCODE字段设为NAME_ERROR
-		if response != nil {                                      // 如果构建响应成功
+		response := buildErrorResponse(request, RCODE_FORMERR) // 格式错误
+		if response != nil {
 			if _, err := conn.WriteToUDP(response, clientAddr); err != nil {
 				logDebug(1, "发送错误响应失败: %v", err)
 			}
@@ -236,11 +225,12 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 		return
 	}
 
+	// 解析DNS请求，获取域名和查询类型
 	domain, qtype, _, err := parseDNSMessage(request)
 	if err != nil {
 		logDebug(1, "解析DNS请求失败: %v", err)
-		response := buildErrorResponse(request, RCODE_NAME_ERROR) // 报文头部RCODE字段设为NAME_ERROR
-		if response != nil {                                      // 如果构建响应成功
+		response := buildErrorResponse(request, RCODE_FORMERR) // 格式错误
+		if response != nil {
 			if _, err := conn.WriteToUDP(response, clientAddr); err != nil {
 				logDebug(1, "发送错误响应失败: %v", err)
 			}
@@ -263,9 +253,10 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 	}
 
 	ips := []string{} // 存储多个IP
-	rcode := 0
+	rcode := 0        // 默认响应码为0（表示成功）
 
-	if cachedIPs, found := lookupCache(domain); found { // 查找缓存
+	// 使用LRU缓存查找
+	if cachedIPs, found := cache.Get(domain); found {
 		ips = cachedIPs
 		logDebug(2, "缓存命中: %s -> %v", domain, ips)
 	} else { // 如果缓存未命中，查找映射表
@@ -286,7 +277,7 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 			if relayedIPs, err := sendDNSQuery(domain, qtype); err == nil { // 转发查询成功
 				ips = relayedIPs
 				logDebug(2, "转发成功: %s -> %v", domain, ips)
-				addToCache(domain, ips, DEFAULT_TTL)
+				cache.Set(domain, ips, DEFAULT_TTL) // 使用LRU缓存
 			} else { // 转发查询失败
 				logDebug(1, "转发失败: %s: %v", domain, err)
 				rcode = RCODE_NAME_ERROR // 设置响应码为NAME_ERROR，表示域名不存在
@@ -301,6 +292,118 @@ func handleClientRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []b
 		}
 	} else {
 		logDebug(1, "构建DNS响应失败")
+	}
+}
+
+// 创建LRU缓存
+func NewLRUCache(capacity int) *LRUCache {
+	return &LRUCache{
+		capacity: capacity,
+		list:     list.New(),
+		cache:    make(map[string]*list.Element),
+	}
+}
+
+// 从缓存中获取
+func (c *LRUCache) Get(domain string) ([]string, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	if elem, ok := c.cache[domain]; ok {
+		entry := elem.Value.(*CacheEntry)
+		if time.Now().Before(entry.Expires) {
+			c.list.MoveToFront(elem)
+			return entry.IPs, true
+		}
+		// 缓存过期，删除
+		c.mutex.RUnlock()
+		c.mutex.Lock()
+		delete(c.cache, domain)
+		c.list.Remove(elem)
+		c.mutex.Unlock()
+		c.mutex.RLock()
+	}
+	return nil, false
+}
+
+// 添加到缓存
+func (c *LRUCache) Set(domain string, ips []string, ttl uint32) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// 如果已存在，更新
+	if elem, ok := c.cache[domain]; ok {
+		entry := elem.Value.(*CacheEntry)
+		entry.IPs = ips
+		entry.TTL = ttl
+		entry.Expires = time.Now().Add(time.Duration(ttl) * time.Second)
+		c.list.MoveToFront(elem)
+		logDebug(2, "更新缓存: %s -> %v (TTL: %d)", domain, ips, ttl)
+		return
+	}
+
+	// 如果缓存已满，移除最久未使用的
+	if c.list.Len() >= c.capacity {
+		elem := c.list.Back()
+		if elem != nil {
+			entry := elem.Value.(*CacheEntry)
+			delete(c.cache, entry.Domain)
+			c.list.Remove(elem)
+			logDebug(2, "缓存满，移除: %s", entry.Domain)
+		}
+	}
+
+	// 添加新条目
+	entry := &CacheEntry{
+		Domain:  domain,
+		IPs:     ips,
+		TTL:     ttl,
+		Expires: time.Now().Add(time.Duration(ttl) * time.Second),
+	}
+	elem := c.list.PushFront(entry)
+	c.cache[domain] = elem
+	logDebug(2, "添加缓存: %s -> %v (TTL: %d)", domain, ips, ttl)
+}
+
+// 工作线程
+func worker(workChan chan WorkRequest) {
+	for req := range workChan {
+		select {
+		case <-shutdownSignal:
+			return
+		default:
+			handleClientRequest(req.conn, req.clientAddr, req.data)
+		}
+	}
+}
+
+// 文件监听
+func watchConfigFile(filename string) {
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+					logDebug(1, "检测到文件修改: %s", event.Name)
+					parseMappingFile(filename)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				logDebug(1, "文件监视错误: %v", err)
+			case <-shutdownSignal:
+				return
+			}
+		}
+	}()
+
+	err := watcher.Add(filename)
+	if err != nil {
+		logDebug(1, "添加文件监视失败: %v", err)
 	}
 }
 
@@ -340,62 +443,51 @@ func parseDNSMessage(buffer []byte) (string, uint16, int, error) {
 
 // 解析域名，支持标签编码和指针压缩，返回域名、QNAME消耗的字节数和错误信息
 func parseDomainName(buffer []byte, offset int) (string, int, error) {
-	var parts []string
-	pos := offset
-	totalBytes := 0 // 累计解析的字节数
-	maxDepth := 10
-	depth := 0
+	// 为了支持标签和指针混用，递归时只统计主路径消耗的字节数
+	var (
+		parts    []string
+		pos      = offset
+		consumed = 0
+	)
 
+	// 遍历域名标签，直到遇到0或指针
 	for {
 		if pos >= len(buffer) {
-			return "", totalBytes, errors.New("域名解析越界")
+			return "", consumed, errors.New("域名解析越界")
 		}
-
-		depth++
-		if depth > maxDepth {
-			return "", totalBytes, errors.New("域名解析递归深度过大")
-		}
-
-		// www.example.com 在 DNS 报文中的存储格式为：
-		// [3] w w w [7] e x a m p l e [3] c o m [0]
-
-		length := int(buffer[pos]) // 读取标签长度
-		pos++                      // 移动到标签内容
-		totalBytes++               // 加.的长度
-
-		if length == 0 {
-			break
-		}
-
-		if length&0xC0 == 0xC0 { // 检测指针压缩
-			if pos >= len(buffer) {
-				return "", totalBytes, errors.New("无效的域名指针")
+		length := int(buffer[pos])
+		// 检查是否为指针
+		if length&0xC0 == 0xC0 {
+			// 指针必须占两个字节
+			if pos+1 >= len(buffer) {
+				return "", consumed, errors.New("无效的域名指针")
 			}
-			// 指针压缩格式为 11xx xxxx   xxxx xxxx ，这后14位即为偏移量，目前pos指向的是指针的第二个字节
-			pointer := int(binary.BigEndian.Uint16([]byte{byte(length & 0x3F), buffer[pos]}))
-			totalBytes = 2 // 指针压缩的长度为2字节
-
+			pointer := int(binary.BigEndian.Uint16(buffer[pos:pos+2]) & 0x3FFF)
+			// 递归解析指针指向的部分，但只统计主路径消耗
 			part, _, err := parseDomainName(buffer, pointer)
 			if err != nil {
-				return "", totalBytes, err
+				return "", consumed, err
 			}
 			parts = append(parts, part)
+			consumed += 2 // 指针占用两个字节
+			break         // 结束解析
+		}
+		pos++            // 跳到标签内容
+		consumed++       // 标签长度占用一个字节
+		if length == 0 { // 遇到0表示域名结束
 			break
 		}
-
 		if pos+length > len(buffer) {
-			return "", totalBytes, errors.New("域名标签超出范围")
+			return "", consumed, errors.New("域名标签超出范围")
 		}
-
-		parts = append(parts, string(buffer[pos:pos+length])) // 读取标签内容
-		pos += length
-		totalBytes += length // 累加标签长度
+		parts = append(parts, string(buffer[pos:pos+length]))
+		pos += length      // 跳过标签内容，指向下一个标签长度
+		consumed += length // 标签内容长度
 	}
-
-	return strings.Join(parts, "."), totalBytes, nil
+	return strings.Join(parts, "."), consumed, nil
 }
 
-// 修改为支持多个IP
+// 根据请求报文，找到的IP地址，响应码和查询类型构建DNS响应报文
 func buildDNSResponse(request []byte, ips []string, rcode int, qtype uint16) []byte {
 	if len(request) < 12 {
 		return nil
@@ -404,6 +496,7 @@ func buildDNSResponse(request []byte, ips []string, rcode int, qtype uint16) []b
 	response := make([]byte, len(request))
 	copy(response, request)
 
+	// 解析DNS请求头部
 	header := DNSHeader{}
 	reader := bytes.NewReader(response[:12])
 	err := binary.Read(reader, binary.BigEndian, &header)
@@ -412,16 +505,11 @@ func buildDNSResponse(request []byte, ips []string, rcode int, qtype uint16) []b
 		return nil
 	}
 
-	// +--+-----+---+---+---+---+---+---+---+----+
-	// |QR|Opcode|AA|TC|RD|RA| Z |AD|CD| RCODE  |
-	// +--+-----+---+---+---+---+---+---+---+----+
-	//  1    4    1   1   1   1   1   1   1   4
+	header.Flags |= FLAG_RESPONSE // 将响应标志位（通常是 QR 位）设置为 1，表示这是一个响应报文
+	header.Flags &= 0xFFF0        // 将RCODE字段清零，其他标志位保持不变
+	header.Flags |= uint16(rcode) //设置 RCODE 字段
 
-	header.Flags |= FLAG_RESPONSE
-	header.Flags &= 0xFFF0
-	header.Flags |= uint16(rcode)
-
-	if len(ips) > 0 && rcode == 0 {
+	if len(ips) > 0 && rcode == RCODE_NO_ERROR {
 		header.ANCount = uint16(len(ips)) // 设置回答数为IP数量
 	}
 
@@ -433,13 +521,14 @@ func buildDNSResponse(request []byte, ips []string, rcode int, qtype uint16) []b
 	}
 	copy(response[:12], buf.Bytes())
 
-	if len(ips) == 0 || rcode != 0 {
+	// 如果没有IP地址或响应码不是无错误，则直接返回错误响应
+	if len(ips) == 0 || rcode != RCODE_NO_ERROR {
 		return response
 	}
 
 	// 构建所有IP的资源记录
 	for _, ip := range ips {
-		rr := buildResourceRecord(ip, qtype)
+		rr := buildResourceRecord(ip, qtype) // 每个找到的ip地址构建一个资源记录
 		if rr == nil {
 			logDebug(1, "构建资源记录失败: %s", ip)
 			continue
@@ -451,20 +540,20 @@ func buildDNSResponse(request []byte, ips []string, rcode int, qtype uint16) []b
 			break
 		}
 
-		response = append(response, rr...)
+		response = append(response, rr...) // 添加资源记录到响应
 	}
 
 	return response
 }
 
-// 构建错误响应
+// 构建错误响应，仅仅修改请求报文的头部，设置响应标志位和RCODE字段
 func buildErrorResponse(request []byte, rcode int) []byte {
 	if len(request) < 12 {
 		return nil
 	}
 
 	response := make([]byte, len(request))
-	copy(response, request)
+	copy(response, request) // 复制请求报文到响应报文
 
 	header := DNSHeader{}
 	reader := bytes.NewReader(response[:12])
@@ -473,22 +562,6 @@ func buildErrorResponse(request []byte, rcode int) []byte {
 		logDebug(1, "解析错误响应头部失败: %v", err)
 		return nil
 	}
-
-	// +--+------+---+---+---+---+---+---+---+------+
-	// |QR|Opcode|AA |TC |RD |RA | Z |AD |CD | RCODE|
-	// +--+------+---+---+---+---+---+---+---+------+
-	//  1    4     1   1   1   1   1   1   1    4
-
-	// QR（1 位）：查询/响应标志（0=查询，1=响应）
-	// Opcode（4 位）：操作码（通常为 0，表示标准查询）
-	// AA（1 位）：权威应答（仅响应时有效）
-	// TC（1 位）：截断标志（消息是否被截断）
-	// RD（1 位）：期望递归（客户端希望递归查询）
-	// RA（1 位）：可用递归（服务器是否支持递归）
-	// Z（1 位）：保留，必须为 0
-	// AD（1 位）：认证数据（DNSSEC，通常为 0）
-	// CD（1 位）：检查禁用（DNSSEC，通常为 0）
-	// RCODE（4 位）：响应码（如 0=无错误，3=域名不存在等）
 
 	header.Flags |= FLAG_RESPONSE // 将响应标志位（通常是 QR 位）设置为 1，表示这是一个响应报文
 	header.Flags &= 0xFFF0
@@ -501,7 +574,7 @@ func buildErrorResponse(request []byte, rcode int) []byte {
 		logDebug(1, "写入错误响应头部失败: %v", err)
 		return nil
 	}
-	copy(response[:12], buf.Bytes())
+	copy(response[:12], buf.Bytes()) // 只有头部被修改
 
 	return response
 }
@@ -510,35 +583,22 @@ func buildErrorResponse(request []byte, rcode int) []byte {
 func buildResourceRecord(ip string, qtype uint16) []byte {
 	buf := new(bytes.Buffer)
 
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  NAME                         |  可变长度，域名（标签编码或压缩指针）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  TYPE                         |  2 字节，记录类型（如 A、AAAA、CNAME 等）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  CLASS                        |  2 字节，记录类（通常为 IN）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                  TTL                          |  4 字节，生存时间（秒）
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |               RDLENGTH                        |  2 字节，RDATA 部分长度
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |               RDATA                           |  可变长度，具体资源数据
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-
 	buf.WriteByte(0xC0)
-	buf.WriteByte(0x0C) // 使用指针压缩，指向域名的起始位置（假设域名在12字节后）
+	buf.WriteByte(0x0C) // 使用指针压缩，指向域名的起始位置
 
-	err := binary.Write(buf, binary.BigEndian, qtype) // 写入资源记录类型
-	if err != nil {
+	if err := binary.Write(buf, binary.BigEndian, qtype); err != nil {
 		logDebug(1, "写入资源记录类型失败: %v", err)
 		return nil
 	}
-	err = binary.Write(buf, binary.BigEndian, uint16(CLASS_IN)) // 写入资源记录类
-	if err != nil {
+	if err := binary.Write(buf, binary.BigEndian, uint16(CLASS_IN)); err != nil {
 		logDebug(1, "写入资源记录类失败: %v", err)
 		return nil
 	}
-	err = binary.Write(buf, binary.BigEndian, uint32(DEFAULT_TTL)) // 写入资源记录TTL
-	if err != nil {
+
+	// 显式使用大端序写入TTL
+	ttlBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(ttlBuf, DEFAULT_TTL)
+	if _, err := buf.Write(ttlBuf); err != nil {
 		logDebug(1, "写入资源记录TTL失败: %v", err)
 		return nil
 	}
@@ -561,19 +621,17 @@ func buildResourceRecord(ip string, qtype uint16) []byte {
 			return nil
 		}
 		dataLength = 16
-	default: // 不支持的资源记录类型
+	default:
 		logDebug(1, "不支持的资源记录类型: %d", qtype)
 		return nil
 	}
 
-	err = binary.Write(buf, binary.BigEndian, dataLength)
-	if err != nil {
+	if err := binary.Write(buf, binary.BigEndian, dataLength); err != nil {
 		logDebug(1, "写入资源记录数据长度失败: %v", err)
 		return nil
 	}
 
-	_, err = buf.Write(ipBytes)
-	if err != nil {
+	if _, err := buf.Write(ipBytes); err != nil {
 		logDebug(1, "写入资源记录IP地址失败: %v", err)
 		return nil
 	}
@@ -583,73 +641,15 @@ func buildResourceRecord(ip string, qtype uint16) []byte {
 
 // 查找域名-IP映射关系
 func lookupMapping(domain string) ([]string, bool) {
+	fileMutex.RLock()
+	defer fileMutex.RUnlock()
+
 	for _, m := range mappingTable {
 		if m.Domain == domain {
 			return m.IPs, true
 		}
 	}
 	return nil, false
-}
-
-// 查找缓存
-func lookupCache(domain string) ([]string, bool) {
-	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
-
-	now := time.Now()
-	for i := 0; i < cacheCount; i++ {
-		if cache[i].Domain == domain {
-			if now.Before(cache[i].Timestamp.Add(time.Duration(cache[i].TTL) * time.Second)) {
-				return cache[i].IPs, true
-			}
-			return nil, false
-		}
-	}
-	return nil, false
-}
-
-// 添加或更新缓存项
-func addToCache(domain string, ips []string, ttl uint32) {
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
-
-	now := time.Now()
-
-	for i := 0; i < cacheCount; i++ { // 遍历缓存
-		if cache[i].Domain == domain { // 如果域名已存在
-			cache[i].IPs = ips       // 更新IP地址列表
-			cache[i].TTL = ttl       // 更新TTL
-			cache[i].Timestamp = now // 更新时间戳
-			logDebug(2, "更新缓存: %s -> %v (TTL: %d)", domain, ips, ttl)
-			// 如果缓存项已存在且未过期，则不需要添加新项
-			return
-		}
-	}
-
-	if cacheCount < cacheMaxSize { // 如果缓存未满
-		logDebug(2, "添加新缓存项: %s -> %v (TTL: %d)", domain, ips, ttl)
-		cache[cacheCount] = CacheEntry{ // 添加新缓存项
-			Domain:    domain,
-			IPs:       ips,
-			TTL:       ttl,
-			Timestamp: now,
-		}
-		cacheCount++
-	} else { // 如果缓存已满，替换最旧的项
-		oldest := 0
-		for i := 1; i < cacheMaxSize; i++ {
-			if cache[i].Timestamp.Before(cache[oldest].Timestamp) { // 找到最旧的缓存项
-				oldest = i
-			}
-		}
-		cache[oldest] = CacheEntry{ // 替换最旧的缓存项
-			Domain:    domain,
-			IPs:       ips,
-			TTL:       ttl,
-			Timestamp: now,
-		}
-		logDebug(2, "替换最旧缓存项: %s -> %v (TTL: %d)", domain, ips, ttl)
-	}
 }
 
 // 发送DNS查询到外部DNS服务器并返回查询结果的IP地址列表
@@ -753,75 +753,21 @@ func parseDNSResponse(response []byte, qtype uint16) ([]string, error) {
 		return nil, fmt.Errorf("解析DNS响应头部失败: %v", err)
 	}
 
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                      ID (16 bits)             |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |QR|   Opcode  |AA|TC|RD|RA|   Z    |   RCODE   |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                    QDCOUNT (16 bits)          |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                    ANCOUNT (16 bits)          |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                    NSCOUNT (16 bits)          |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                    ARCOUNT (16 bits)          |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-
 	rcode := header.Flags & 0x000F // 提取响应码
-	if rcode != 0 {                // 非0响应码表示错误
+	if rcode != RCODE_NO_ERROR {   // 非0响应码表示错误
 		return nil, fmt.Errorf("DNS错误: %d", rcode)
 	}
 
 	pos := 12
-	domain, consumed, err := parseDomainName(response, pos) //从问题部分解析域名
+	_, consumed, err := parseDomainName(response, pos) //从问题部分解析域名
 	if err != nil {
 		return nil, err
 	}
 	pos += consumed + 4 // 跳过问题部分，QTYPE（2 字节）和 QCLASS（2 字节）
 
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                                               |
-	// /                     QNAME                     /
-	// /                                               /
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                     QTYPE                     |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                     QCLASS                    |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-
 	ips := []string{}
-	defer func() {
-		if len(ips) > 0 {
-			addToCache(domain, ips, DEFAULT_TTL) // 将解析到的IP地址添加到缓存
-		}
-	}()
-
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                                               |
-	// /                                               /
-	// /                      NAME                     /
-	// |                                               |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                      TYPE                     |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                     CLASS                     |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                      TTL                      |
-	// |                                               |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-	// |                   RDLENGTH                    |
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--|
-	// /                     RDATA                     /
-	// /                                               /
-	// +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-
+	
 	for i := 0; i < int(header.ANCount); i++ { // 遍历回答部分，每个回答部分报文格式相同
-
-		// Header
-		// Question
-		// Answer 1（IP1）
-		// Answer 2（IP2）
-		// Answer 3（IP3）
 
 		if pos >= len(response) {
 			return ips, errors.New("响应越界")
@@ -829,19 +775,10 @@ func parseDNSResponse(response []byte, qtype uint16) ([]string, error) {
 
 		// 处理名称字段
 		if response[pos]&0xC0 == 0xC0 { // 指针压缩
-
-			// 举例说明：
-			// 报文中 Question 区有 www.example.com 的标签式编码。
-			// Answer 区的 NAME 字段为 0xC0 0x0C，表示指向报文第 12 字节
-			// （通常是 Question 区域的域名起始位置）。
-			// 解析时跳转到第 12 字节，读取标签，得到 www.example.com。
-
 			pos += 2 // 跳过指针
 		} else {
-
 			// 域名 www.example.com 的编码为：
 			// [3] w w w [7] e x a m p l e [3] c o m [0]
-
 			for {
 				if pos >= len(response) {
 					return ips, errors.New("域名解析越界")
@@ -912,6 +849,12 @@ func getNextID() uint16 {
 
 // 从映射文件中解析域名-IP映射关系
 func parseMappingFile(filename string) {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+
+	// 重置映射表
+	mappingTable = nil
+
 	file, err := os.Open(filename)
 	if err != nil {
 		logDebug(1, "无法打开映射文件: %s", filename)
@@ -920,10 +863,8 @@ func parseMappingFile(filename string) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	lineNum := 0
-	cntHere := 0
+	count := 0
 	for scanner.Scan() {
-		lineNum++
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 
@@ -933,48 +874,38 @@ func parseMappingFile(filename string) {
 
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
-			logDebug(1, "无效的行格式: %s (行 %d)", line, lineNum)
+			logDebug(1, "无效的行格式: %s", line)
 			continue
 		}
 
-		// 第一个部分是域名
 		domain := parts[0]
-		// 其余部分都是IP地址
 		ips := []string{}
 
 		for i := 1; i < len(parts); i++ {
 			ip := parts[i]
 			if net.ParseIP(ip) == nil {
-				logDebug(1, "无效的IP地址: %s 在映射文件 %s 行 %d", ip, filename, lineNum)
+				logDebug(1, "无效的IP地址: %s", ip)
 				continue
-			} // 检查IP地址有效性
+			}
 			ips = append(ips, ip)
 		}
 
 		if len(ips) == 0 {
 			continue
-		} // 如果没有有效的IP地址，则跳过此行
-
-		if len(domain) > MAX_DOMAIN_LEN {
-			logDebug(1, "域名过长: %s (行 %d)", domain, lineNum)
-			continue
-		} // 检查域名长度
+		}
 
 		mappingTable = append(mappingTable, DomainIPMapping{
 			Domain: domain,
 			IPs:    ips,
-		}) // 记录映射关系
-
-		cntHere++ // 统计当前文件的映射条数
+		})
+		count++
 	}
 
 	if err := scanner.Err(); err != nil {
 		logDebug(1, "读取映射文件失败: %v", err)
 	}
 
-	mappingCount += cntHere
-
-	logDebug(1, "解析映射文件 %s，共 %d 条记录", filename, cntHere)
+	logDebug(1, "解析映射文件 %s，共 %d 条记录", filename, count)
 }
 
 // 调试等级：0 - 无调试信息，1 - 基本调试信息
